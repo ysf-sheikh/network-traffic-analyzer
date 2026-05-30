@@ -1,4 +1,4 @@
-# PCAP Traffic Analyzer (Foundation Phase)
+# PCAP Traffic Analyzer
 
 This project provides a **clean, structured foundation** for analyzing offline PCAP files.
 In this project, the focus is on:
