@@ -4,93 +4,124 @@ import dpkt
 
 from src.utils.helpers import protocol_number_to_name, safe_int
 
-
 def read_pcap(pcap_path: str) -> Generator[Dict[str, Any], None, None]:
-    """
-    Read a PCAP file and yield packet metadata dictionaries.
+"""
+Parse a PCAP/PCAPNG capture file and yield normalized packet metadata.
 
-    Each yielded dictionary has the form:
-        {
-            "timestamp": float,
-            "src_ip": str,
-            "dst_ip": str,
-            "protocol": str,
-            "src_port": int,
-            "dst_port": int,
-            "length": int
-        }
+```
+Each packet is converted into a lightweight dictionary containing the
+information required by downstream flow-tracking and analysis modules.
 
-    Notes:
-        - Only IP (IPv4/IPv6) + TCP/UDP packets are considered.
-        - Non-IP and non-TCP/UDP packets are skipped.
-    """
-    with open(pcap_path, "rb") as f:
-        if pcap_path.endswith(".pcapng"):
-            pcap = dpkt.pcapng.Reader(f)
+Returned packet structure:
+    {
+        "timestamp": float,
+        "src_ip": str,
+        "dst_ip": str,
+        "protocol": str,
+        "src_port": int,
+        "dst_port": int,
+        "length": int
+    }
+
+Processing rules:
+    - Supports both .pcap and .pcapng formats.
+    - Only IPv4 and IPv6 traffic is considered.
+    - Only TCP and UDP transport protocols are processed.
+    - Corrupted frames and unsupported packet types are skipped.
+    - Designed for efficient streaming of packet metadata rather than
+      loading an entire capture into memory.
+
+Yields:
+    Dictionary containing normalized packet metadata.
+"""
+with open(pcap_path, "rb") as f:
+    # Select the appropriate reader based on file extension
+    if pcap_path.endswith(".pcapng"):
+        pcap = dpkt.pcapng.Reader(f)
+    else:
+        pcap = dpkt.pcap.Reader(f)
+
+    # Iterate through packets in chronological order
+    for ts, buf in pcap:
+        try:
+            # Decode Ethernet frame
+            eth = dpkt.ethernet.Ethernet(buf)
+        except (dpkt.UnpackError, ValueError):
+            # Skip malformed or corrupted frames
+            continue
+
+        # Extract IP layer and ignore non-IP traffic
+        ip = eth.data
+        if not isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
+            continue
+
+        # Convert source and destination addresses into
+        # human-readable string representations
+        src_ip = _inet_to_str(ip.src)
+        dst_ip = _inet_to_str(ip.dst)
+
+        # Resolve protocol number into a friendly protocol name
+        proto_num = getattr(ip, "p", None)
+        protocol_name = protocol_number_to_name(proto_num) if proto_num is not None else "UNKNOWN"
+
+        # Extract transport-layer payload
+        transport = ip.data
+
+        # Only TCP and UDP traffic are used for flow tracking
+        src_port = None
+        dst_port = None
+
+        if isinstance(transport, dpkt.tcp.TCP) or isinstance(transport, dpkt.udp.UDP):
+            src_port = safe_int(getattr(transport, "sport", None))
+            dst_port = safe_int(getattr(transport, "dport", None))
         else:
-            pcap = dpkt.pcap.Reader(f)
+            # Ignore other IP protocols (ICMP, GRE, ESP, etc.)
+            continue
 
-        for ts, buf in pcap:
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-            except (dpkt.UnpackError, ValueError):
-                # Corrupted frame; skip safely
-                continue
+        # Original packet size in bytes
+        length = len(buf)
 
-            # Filter non-IP traffic
-            ip = eth.data
-            if not isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
-                continue
-
-            src_ip = _inet_to_str(ip.src)
-            dst_ip = _inet_to_str(ip.dst)
-            proto_num = getattr(ip, "p", None)
-            protocol_name = protocol_number_to_name(proto_num) if proto_num is not None else "UNKNOWN"
-
-            transport = ip.data
-
-            # Only consider TCP/UDP for flow tracking in this phase
-            src_port = None
-            dst_port = None
-
-            if isinstance(transport, dpkt.tcp.TCP) or isinstance(transport, dpkt.udp.UDP):
-                src_port = safe_int(getattr(transport, "sport", None))
-                dst_port = safe_int(getattr(transport, "dport", None))
-            else:
-                # Non-TCP/UDP IP traffic not considered in this initial phase
-                continue
-
-            length = len(buf)
-
-            yield {
-                "timestamp": float(ts),
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "protocol": protocol_name,
-                "src_port": src_port,
-                "dst_port": dst_port,
-                "length": length,
-            }
-
+        # Yield normalized packet metadata
+        yield {
+            "timestamp": float(ts),
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "protocol": protocol_name,
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "length": length,
+        }
+```
 
 def _inet_to_str(inet_bytes: bytes) -> str:
-    """
-    Convert an IP address from bytes to string (supports IPv4 and IPv6).
+"""
+Convert raw IP address bytes into a human-readable string.
 
-    This avoids importing socket in top-level for readability, but you could
-    move this to helpers if you want broader reuse.
-    """
-    import socket
+```
+Supports:
+    - IPv4 addresses
+    - IPv6 addresses
 
-    try:
-        # Try IPv4
-        return socket.inet_ntop(socket.AF_INET, inet_bytes)
-    except (ValueError, OSError):
-        pass
+A hexadecimal representation is returned as a fallback if the address
+cannot be decoded successfully.
 
-    try:
-        # Try IPv6
-        return socket.inet_ntop(socket.AF_INET6, inet_bytes)
-    except (ValueError, OSError):
-        # Fallback: hex representation if something odd happens
-        return inet_bytes.hex()
+Args:
+    inet_bytes: Raw network-order IP address bytes.
+
+Returns:
+    String representation of the IP address.
+"""
+import socket
+
+try:
+    # Attempt IPv4 conversion
+    return socket.inet_ntop(socket.AF_INET, inet_bytes)
+except (ValueError, OSError):
+    pass
+
+try:
+    # Attempt IPv6 conversion
+    return socket.inet_ntop(socket.AF_INET6, inet_bytes)
+except (ValueError, OSError):
+    # Fallback for unexpected address formats
+    return inet_bytes.hex()
